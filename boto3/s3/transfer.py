@@ -455,9 +455,9 @@ class MultipartUploader(object):
     def _upload_one_part_file_obj(self, file_obj, file_obj_size, bucket, key,
                                   upload_id, part_size, extra_args,
                                   callback, part_number):
-        open_chunk_reader = ReadFileChunk
-        with open_chunk_reader(file_obj, part_size * (part_number - 1),
-                               part_size, file_obj_size, callback) as body:
+        with ReadFileChunk(file_obj, part_size * (part_number - 1),
+                           part_size, file_obj_size, callback,
+                           enable_callback=False) as body:
             response = self._client.upload_part(
                 Bucket=bucket, Key=key,
                 UploadId=upload_id, PartNumber=part_number, Body=body,
@@ -726,10 +726,9 @@ class S3Transfer(object):
                     bucket, key, callback, extra_args):
         # We're using open_file_chunk_reader so we can take advantage of the
         # progress callback functionality.
-        open_chunk_reader = ReadFileChunk
-        with open_chunk_reader(file_obj, 0,
-                               file_obj_size, file_obj_size,
-                               callback=callback) as body:
+        with ReadFileChunk(file_obj, 0, file_obj_size, file_obj_size,
+                           callback=callback,
+                           enable_callback=False) as body:
             self._client.put_object(Bucket=bucket, Key=key, Body=body,
                                     **extra_args)
 
