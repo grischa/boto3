@@ -350,7 +350,7 @@ class MultipartUploader(object):
         'RequestPayer',
     ]
 
-    def __init__(self, client, config, osutil,
+    def __init__(self, client, config, osutil=None,
                  executor_cls=futures.ThreadPoolExecutor):
         self._client = client
         self._config = config
@@ -385,6 +385,27 @@ class MultipartUploader(object):
             Bucket=bucket, Key=key, UploadId=upload_id,
             MultipartUpload={'Parts': parts})
 
+    def upload_file_obj(self, file_obj, file_obj_size,
+                        bucket, key, callback, extra_args):
+        response = self._client.create_multipart_upload(Bucket=bucket,
+                                                        Key=key, **extra_args)
+        upload_id = response['UploadId']
+        try:
+            parts = self._upload_parts_file_obj(
+                upload_id, file_obj, file_obj_size,
+                bucket, key, callback, extra_args)
+        except Exception as e:
+            logger.debug("Exception raised while uploading parts, "
+                         "aborting multipart upload.", exc_info=True)
+            self._client.abort_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id)
+            raise S3UploadFailedError(
+                "Failed to upload %s to %s: %s" % (
+                    str(file_obj), '/'.join([bucket, key]), e))
+        self._client.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={'Parts': parts})
+
     def _upload_parts(self, upload_id, filename, bucket, key, callback,
                       extra_args):
         upload_parts_extra_args = self._extra_upload_part_args(extra_args)
@@ -401,12 +422,42 @@ class MultipartUploader(object):
                 parts.append(part)
         return parts
 
+    def _upload_parts_file_obj(self, upload_id, file_obj, file_obj_size,
+                               bucket, key, callback, extra_args):
+        upload_parts_extra_args = self._extra_upload_part_args(extra_args)
+        parts = []
+        part_size = self._config.multipart_chunksize
+        num_parts = int(
+            math.ceil(file_obj_size / float(part_size)))
+        max_workers = self._config.max_concurrency
+        with self._executor_cls(max_workers=max_workers) as executor:
+            upload_partial = functools.partial(
+                self._upload_one_part_file_obj, file_obj, file_obj_size,
+                bucket, key, upload_id,
+                part_size, upload_parts_extra_args, callback)
+            for part in executor.map(upload_partial, range(1, num_parts + 1)):
+                parts.append(part)
+        return parts
+
     def _upload_one_part(self, filename, bucket, key,
                          upload_id, part_size, extra_args,
                          callback, part_number):
         open_chunk_reader = self._os.open_file_chunk_reader
         with open_chunk_reader(filename, part_size * (part_number - 1),
                                part_size, callback) as body:
+            response = self._client.upload_part(
+                Bucket=bucket, Key=key,
+                UploadId=upload_id, PartNumber=part_number, Body=body,
+                **extra_args)
+            etag = response['ETag']
+            return {'ETag': etag, 'PartNumber': part_number}
+
+    def _upload_one_part_file_obj(self, file_obj, file_obj_size, bucket, key,
+                                  upload_id, part_size, extra_args,
+                                  callback, part_number):
+        open_chunk_reader = ReadFileChunk
+        with open_chunk_reader(file_obj, part_size * (part_number - 1),
+                               part_size, file_obj_size, callback) as body:
             response = self._client.upload_part(
                 Bucket=bucket, Key=key,
                 UploadId=upload_id, PartNumber=part_number, Body=body,
@@ -632,12 +683,52 @@ class S3Transfer(object):
         else:
             self._put_object(filename, bucket, key, callback, extra_args)
 
+    def upload_file_obj(self, file_obj, bucket, key,
+                        callback=None, extra_args=None):
+        """Upload a file to an S3 object.
+
+        Variants have also been injected into S3 client, Bucket and Object.
+        You don't have to use S3Transfer.upload_file() directly.
+        """
+        if extra_args is None:
+            extra_args = {}
+        self._validate_all_known_args(extra_args, self.ALLOWED_UPLOAD_ARGS)
+        events = self._client.meta.events
+        events.register_first('request-created.s3',
+                              disable_upload_callbacks,
+                              unique_id='s3upload-callback-disable')
+        events.register_last('request-created.s3',
+                             enable_upload_callbacks,
+                             unique_id='s3upload-callback-enable')
+        # get size for any file like object
+        old_file_position = f.tell()
+        file_obj.seek(0, os.SEEK_END)
+        file_obj_size = f.tell()
+        file_obj.seek(old_file_position, os.SEEK_SET)
+        if file_obj_size >= self._config.multipart_threshold:
+            self._multipart_upload_file_obj(
+                file_obj, file_obj_size, bucket, key, callback, extra_args)
+        else:
+            self._put_object_file_obj(file_obj, file_obj_size,
+                                      bucket, key, callback, extra_args)
+
     def _put_object(self, filename, bucket, key, callback, extra_args):
         # We're using open_file_chunk_reader so we can take advantage of the
         # progress callback functionality.
         open_chunk_reader = self._osutil.open_file_chunk_reader
         with open_chunk_reader(filename, 0,
                                self._osutil.get_file_size(filename),
+                               callback=callback) as body:
+            self._client.put_object(Bucket=bucket, Key=key, Body=body,
+                                    **extra_args)
+
+    def _put_object_file_obj(self, file_obj, file_obj_size,
+                    bucket, key, callback, extra_args):
+        # We're using open_file_chunk_reader so we can take advantage of the
+        # progress callback functionality.
+        open_chunk_reader = ReadFileChunk
+        with open_chunk_reader(file_obj, 0,
+                               file_obj_size, file_obj_size,
                                callback=callback) as body:
             self._client.put_object(Bucket=bucket, Key=key, Body=body,
                                     **extra_args)
@@ -726,3 +817,9 @@ class S3Transfer(object):
     def _multipart_upload(self, filename, bucket, key, callback, extra_args):
         uploader = MultipartUploader(self._client, self._config, self._osutil)
         uploader.upload_file(filename, bucket, key, callback, extra_args)
+
+    def _multipart_upload_file_obj(self, file_obj, file_obj_size,
+                                   bucket, key, callback, extra_args):
+        uploader = MultipartUploader(self._client, self._config)
+        uploader.upload_file_obj(file_obj, file_obj_size,
+                                 bucket, key, callback, extra_args)
