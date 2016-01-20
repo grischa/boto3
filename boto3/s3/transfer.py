@@ -37,6 +37,7 @@ to configure many aspects of the transfer process including:
 There is no support for s3->s3 multipart copies at this
 time.
 
+There are additional methods that upload file like objects.
 
 .. _ref_s3transfer_usage:
 
@@ -51,6 +52,11 @@ The simplest way to use this module is:
     transfer = S3Transfer(client)
     # Upload /tmp/myfile to s3://bucket/key
     transfer.upload_file('/tmp/myfile', 'bucket', 'key')
+
+    # Upload a file like object
+    from StringIO import StringIO
+    fo = StringIO('some content')
+    transfer.upload_file_obj(fo, 'bucket', 'key')
 
     # Download s3://bucket/key to /tmp/myfile
     transfer.download_file('bucket', 'key', '/tmp/myfile')
@@ -72,7 +78,7 @@ client operation.  Here are a few examples using ``upload_file``::
                          extra_args={'ContentType': "application/json"})
 
 
-The ``S3Transfer`` clas also supports progress callbacks so you can
+The ``S3Transfer`` class also supports progress callbacks so you can
 provide transfer progress to users.  Both the ``upload_file`` and
 ``download_file`` methods take an optional ``callback`` parameter.
 Here's an example of how to print a simple progress percentage
@@ -683,12 +689,12 @@ class S3Transfer(object):
         else:
             self._put_object(filename, bucket, key, callback, extra_args)
 
-    def upload_file_obj(self, file_obj, bucket, key,
+    def upload_file_obj(self, file_obj, bucket, key, file_obj_size=None,
                         callback=None, extra_args=None):
-        """Upload a file to an S3 object.
+        """Upload a file like object to an S3 object.
 
         Variants have also been injected into S3 client, Bucket and Object.
-        You don't have to use S3Transfer.upload_file() directly.
+        You don't have to use S3Transfer.upload_file_obj() directly.
         """
         if extra_args is None:
             extra_args = {}
@@ -700,11 +706,12 @@ class S3Transfer(object):
         events.register_last('request-created.s3',
                              enable_upload_callbacks,
                              unique_id='s3upload-callback-enable')
-        # get size for any file like object
-        old_file_position = f.tell()
-        file_obj.seek(0, os.SEEK_END)
-        file_obj_size = f.tell()
-        file_obj.seek(old_file_position, os.SEEK_SET)
+        if file_obj_size is None:
+            # get size for any file like object
+            old_file_position = file_obj.tell()
+            file_obj.seek(0, os.SEEK_END)
+            file_obj_size = file_obj.tell()
+            file_obj.seek(old_file_position, os.SEEK_SET)
         if file_obj_size >= self._config.multipart_threshold:
             self._multipart_upload_file_obj(
                 file_obj, file_obj_size, bucket, key, callback, extra_args)
@@ -723,7 +730,7 @@ class S3Transfer(object):
                                     **extra_args)
 
     def _put_object_file_obj(self, file_obj, file_obj_size,
-                    bucket, key, callback, extra_args):
+                             bucket, key, callback, extra_args):
         # We're using open_file_chunk_reader so we can take advantage of the
         # progress callback functionality.
         with ReadFileChunk(file_obj, 0, file_obj_size, file_obj_size,
